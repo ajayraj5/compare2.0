@@ -8,6 +8,11 @@ from frappe import _, qb, scrub
 from frappe.query_builder import Order
 from frappe.utils import cint, flt, formatdate
 
+from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import (
+	get_accounting_dimensions,
+	get_dimension_with_children,
+)
+from erpnext.accounts.report.financial_statements import get_cost_centers_with_children
 from erpnext.controllers.queries import get_match_cond
 from erpnext.stock.report.stock_ledger.stock_ledger import get_item_group_condition
 from erpnext.stock.utils import get_incoming_rate
@@ -120,6 +125,13 @@ def execute(filters=None):
 				"gross_profit_percent",
 			],
 			"project": ["project", "base_amount", "buying_amount", "gross_profit", "gross_profit_percent"],
+			"cost_center": [
+				"cost_center",
+				"base_amount",
+				"buying_amount",
+				"gross_profit",
+				"gross_profit_percent",
+			],
 			"territory": [
 				"territory",
 				"base_amount",
@@ -154,12 +166,6 @@ def execute(filters=None):
 
 	else:
 		get_data_when_not_grouped_by_invoice(gross_profit_data, filters, group_wise_columns, data)
-
-	
-	for idx,row in enumerate(data):
-		if(data[idx].selling_amount == 0 and data[idx].buying_amount == 0):
-			data[idx].gross_profit = 0
-			data[idx]['gross_profit_%'] = 0
 
 	return columns, data
 
@@ -305,7 +311,14 @@ def get_columns(group_wise_columns, filters):
 				"fieldname": "project",
 				"fieldtype": "Link",
 				"options": "Project",
-				"width": 100,
+				"width": 140,
+			},
+			"cost_center": {
+				"label": _("Cost Center"),
+				"fieldname": "cost_center",
+				"fieldtype": "Link",
+				"options": "Cost Center",
+				"width": 140,
 			},
 			"sales_person": {
 				"label": _("Sales Person"),
@@ -441,7 +454,9 @@ class GrossProfitGenerator:
 			if row.update_stock:
 				product_bundles = self.product_bundles.get(row.parenttype, {}).get(row.parent, frappe._dict())
 			elif row.dn_detail:
-				product_bundles = self.product_bundles.get("Delivery Note", {}).get(row.delivery_note, frappe._dict())
+				product_bundles = self.product_bundles.get("Delivery Note", {}).get(
+					row.delivery_note, frappe._dict()
+				)
 				row.item_row = row.dn_detail
 				# Update warehouse and base_amount from 'Packed Item' List
 				if product_bundles and not row.parent:
@@ -456,7 +471,7 @@ class GrossProfitGenerator:
 								row.warehouse = packed_item.warehouse
 								row.base_amount = packed_item.base_amount
 
-			# Get buying amount
+			# get buying amount
 			if row.item_code in product_bundles:
 				row.buying_amount = flt(
 					self.get_buying_amount_from_product_bundle(row, product_bundles[row.item_code]),
@@ -472,7 +487,7 @@ class GrossProfitGenerator:
 					row.buying_amount = buying_amount
 					buying_amount = 0
 
-			# Get buying rate
+			# get buying rate
 			if flt(row.qty):
 				row.buying_rate = flt(row.buying_amount / flt(row.qty), self.float_precision)
 				row.base_rate = flt(row.base_amount / flt(row.qty), self.float_precision)
@@ -480,20 +495,16 @@ class GrossProfitGenerator:
 				if self.is_not_invoice_row(row):
 					row.buying_rate, row.base_rate = 0.0, 0.0
 
-			if flt(row.base_amount) == 0 and flt(row.buying_amount) == 0:
-				row.gross_profit = 0
-				row.gross_profit_percent = 0
+			# calculate gross profit
+			row.gross_profit = flt(row.base_amount - row.buying_amount, self.currency_precision)
+			if row.base_amount:
+				row.gross_profit_percent = flt(
+					(row.gross_profit / row.base_amount) * 100.0, self.currency_precision
+				)
 			else:
-				# Calculate gross profit
-				row.gross_profit = flt(row.base_amount - row.buying_amount, self.currency_precision)
-				if row.base_amount:
-					row.gross_profit_percent = flt(
-						(row.gross_profit / row.base_amount) * 100.0, self.currency_precision
-					)
-				else:
-					row.gross_profit_percent = 0.0
+				row.gross_profit_percent = 0.0
 
-			# Add to grouped
+			# add to grouped
 			self.grouped.setdefault(row.get(scrub(self.filters.group_by)), []).append(row)
 
 		if self.grouped:
@@ -533,7 +544,7 @@ class GrossProfitGenerator:
 						invoice_portion = 100
 					elif row.invoice_portion:
 						invoice_portion = row.invoice_portion
-					else:
+					elif row.payment_amount:
 						invoice_portion = row.payment_amount * 100 / row.base_net_amount
 
 					if i == 0:
@@ -713,6 +724,9 @@ class GrossProfitGenerator:
 				}
 			)
 
+			if row.serial_and_batch_bundle:
+				args.update({"serial_and_batch_bundle": row.serial_and_batch_bundle})
+
 			average_buying_rate = get_incoming_rate(args)
 			self.average_buying_rate[key] = flt(average_buying_rate)
 
@@ -793,6 +807,38 @@ class GrossProfitGenerator:
 		if self.filters.get("item_code"):
 			conditions += " and `tabSales Invoice Item`.item_code = %(item_code)s"
 
+		if self.filters.get("cost_center"):
+			self.filters.cost_center = frappe.parse_json(self.filters.get("cost_center"))
+			self.filters.cost_center = get_cost_centers_with_children(self.filters.cost_center)
+			conditions += " and `tabSales Invoice Item`.cost_center in %(cost_center)s"
+
+		if self.filters.get("project"):
+			self.filters.project = frappe.parse_json(self.filters.get("project"))
+			conditions += " and `tabSales Invoice Item`.project in %(project)s"
+
+		accounting_dimensions = get_accounting_dimensions(as_list=False)
+		if accounting_dimensions:
+			for dimension in accounting_dimensions:
+				if self.filters.get(dimension.fieldname):
+					if frappe.get_cached_value("DocType", dimension.document_type, "is_tree"):
+						self.filters[dimension.fieldname] = get_dimension_with_children(
+							dimension.document_type, self.filters.get(dimension.fieldname)
+						)
+						conditions += (
+							f" and `tabSales Invoice Item`.{dimension.fieldname} in %({dimension.fieldname})s"
+						)
+					else:
+						conditions += (
+							f" and `tabSales Invoice Item`.{dimension.fieldname} in %({dimension.fieldname})s"
+						)
+
+		if self.filters.get("warehouse"):
+			warehouse_details = frappe.db.get_value(
+				"Warehouse", self.filters.get("warehouse"), ["lft", "rgt"], as_dict=1
+			)
+			if warehouse_details:
+				conditions += f" and `tabSales Invoice Item`.warehouse in (select name from `tabWarehouse` wh where wh.lft >= {warehouse_details.lft} and wh.rgt <= {warehouse_details.rgt} and warehouse = wh.name)"
+
 		self.si_list = frappe.db.sql(
 			"""
 			select
@@ -808,7 +854,7 @@ class GrossProfitGenerator:
 				`tabSales Invoice Item`.delivery_note, `tabSales Invoice Item`.stock_qty as qty,
 				`tabSales Invoice Item`.base_net_rate, `tabSales Invoice Item`.base_net_amount,
 				`tabSales Invoice Item`.name as "item_row", `tabSales Invoice`.is_return,
-				`tabSales Invoice Item`.cost_center
+				`tabSales Invoice Item`.cost_center, `tabSales Invoice Item`.serial_and_batch_bundle
 				{sales_person_cols}
 				{payment_term_cols}
 			from
